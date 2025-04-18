@@ -1,163 +1,159 @@
-import telebot
-from telebot import types
-import json
-import datetime
+import sqlite3
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils import executor
+from datetime import datetime, timedelta
 import os
-import schedule
-import time
-import threading
 
-TOKEN = os.getenv("TOKEN")
-bot = telebot.TeleBot(TOKEN)
+# Инициализация бота
+API_TOKEN = os.getenv('BOT_TOKEN')  # Получаем токен из переменной окружения
+if not API_TOKEN:
+    raise ValueError("BOT_TOKEN не найден в переменных окружения!")
 
-FIT_FILE = "fit_data.json"
-PLANS_FILE = "plans_data.json"
-WANTS_FILE = "wants_data.json"
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
 
-def load_data(filename):
-    if not os.path.exists(filename):
-        return {}
-    with open(filename, "r") as f:
-        return json.load(f)
+# Подключение к базе данных
+conn = sqlite3.connect('withlilybot.db', check_same_thread=False)
+cursor = conn.cursor()
 
-def save_data(data, filename):
-    with open(filename, "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+# Создание таблиц в базе данных
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS fit_tracker (
+    user_id INTEGER,
+    date TEXT,
+    steps INTEGER,
+    calories INTEGER,
+    weight REAL
+)
+''')
 
-def get_today():
-    return datetime.datetime.now().strftime("%Y-%m-%d")
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS plans (
+    user_id INTEGER,
+    date TEXT,
+    plan TEXT,
+    time TEXT
+)
+''')
 
-def get_week_dates():
-    today = datetime.date.today()
-    start = today - datetime.timedelta(days=today.weekday())
-    return [(start + datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS wishlist (
+    user_id INTEGER,
+    link TEXT,
+    name TEXT,
+    category TEXT
+)
+''')
 
-def get_month_dates():
-    today = datetime.date.today()
-    return [f"{today.year}-{today.month:02}-{i:02}" for i in range(1, 32)]
+conn.commit()
 
-user_states = {}
-temp_plans = {}
-temp_wants = {}
+# Главное меню (ReplyKeyboardMarkup)
+main_menu_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+main_menu_keyboard.add(
+    KeyboardButton("Fit трекер"),
+    KeyboardButton("Мои планы"),
+    KeyboardButton("Мои хотелки")
+)
 
-@bot.message_handler(commands=['start'])
-def start_message(message):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("📊 Fit трекер", "📅 Мои планы", "🎁 Хотелки")
-    bot.send_message(message.chat.id, "Привет! Я бот WithLilyBot 💜\nВыбери раздел:", reply_markup=markup)
+# Fit трекер меню (InlineKeyboardMarkup)
+fit_menu = InlineKeyboardMarkup(row_width=1)
+fit_menu.add(
+    InlineKeyboardButton("Записать шаги за сегодня", callback_data="record_steps"),
+    InlineKeyboardButton("Записать калории за сегодня", callback_data="record_calories"),
+    InlineKeyboardButton("Записать вес", callback_data="record_weight"),
+    InlineKeyboardButton("Статистика за неделю", callback_data="weekly_stats"),
+    InlineKeyboardButton("Статистика за месяц", callback_data="monthly_stats")
+)
 
-@bot.message_handler(func=lambda m: m.text == "📊 Fit трекер")
-def fit_menu(message):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add("➕ Вес", "➕ Шаги", "➕ Калории",
-               "📈 Статистика недели", "📆 Статистика месяца", "⬅️ Назад")
-    bot.send_message(message.chat.id, "Выбери, что хочешь записать или посмотреть:", reply_markup=markup)
+# Мои планы меню (InlineKeyboardMarkup)
+plans_menu = InlineKeyboardMarkup(row_width=1)
+plans_menu.add(
+    InlineKeyboardButton("Добавить план", callback_data="add_plan"),
+    InlineKeyboardButton("Планы на неделю", callback_data="week_plans"),
+    InlineKeyboardButton("Планы на месяц", callback_data="month_plans")
+)
 
-@bot.message_handler(func=lambda m: m.text == "📅 Мои планы")
-def plans_menu(message):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("➕ Записать план", "📋 Планы на неделю", "📅 Планы на месяц", "⬅️ Назад")
-    bot.send_message(message.chat.id, "Раздел 'Мои планы'. Что делаем?", reply_markup=markup)
+# Мои хотелки меню (InlineKeyboardMarkup)
+wishlist_menu = InlineKeyboardMarkup(row_width=1)
+wishlist_menu.add(
+    InlineKeyboardButton("Добавить хотелку", callback_data="add_wishlist"),
+    InlineKeyboardButton("Список хотелок", callback_data="wishlist_list"),
+    InlineKeyboardButton("По категориям", callback_data="wishlist_categories")
+)
 
-@bot.message_handler(func=lambda m: m.text == "🎁 Хотелки")
-def wants_menu(message):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("➕ Добавить хотелку", "📂 Список по категории", "⬅️ Назад")
-    bot.send_message(message.chat.id, "Раздел 'Хотелки'. Выбери действие:", reply_markup=markup)
+# Команда /start
+@dp.message_handler(commands=['start'])
+async def send_welcome(message: types.Message):
+    await message.answer(
+        "Привет! Это withLilyBot. Выберите раздел:",
+        reply_markup=main_menu_keyboard
+    )
 
-@bot.message_handler(func=lambda m: m.text == "➕ Добавить хотелку")
-def add_want_step1(message):
-    user_states[message.chat.id] = "want_link"
-    bot.send_message(message.chat.id, "Вставь ссылку на хотелку 🌐")
+# Обработка текстовых команд из главного меню
+@dp.message_handler(lambda message: message.text in ["Fit трекер", "Мои планы", "Мои хотелки"])
+async def process_main_menu_text(message: types.Message):
+    if message.text == "Fit трекер":
+        await message.answer("Выберите действие в Fit трекере:", reply_markup=fit_menu)
+    elif message.text == "Мои планы":
+        await message.answer("Выберите действие в Моих планах:", reply_markup=plans_menu)
+    elif message.text == "Мои хотелки":
+        await message.answer("Выберите действие в Моих хотелках:", reply_markup=wishlist_menu)
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id) == "want_link")
-def add_want_link(message):
-    temp_wants[message.chat.id] = {"link": message.text}
-    user_states[message.chat.id] = "want_title"
-    bot.send_message(message.chat.id, "Как назвать эту хотелку?")
+# Обработка инлайн-кнопок
+@dp.callback_query_handler(lambda c: c.data in ["fit_tracker", "my_plans", "wishlist"])
+async def process_main_menu_inline(callback_query: types.CallbackQuery):
+    if callback_query.data == "fit_tracker":
+        await bot.send_message(callback_query.from_user.id, "Выберите действие в Fit трекере:", reply_markup=fit_menu)
+    elif callback_query.data == "my_plans":
+        await bot.send_message(callback_query.from_user.id, "Выберите действие в Моих планах:", reply_markup=plans_menu)
+    elif callback_query.data == "wishlist":
+        await bot.send_message(callback_query.from_user.id, "Выберите действие в Моих хотелках:", reply_markup=wishlist_menu)
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id) == "want_title")
-def add_want_title(message):
-    temp_wants[message.chat.id]["title"] = message.text
-    user_states[message.chat.id] = "want_category"
-    bot.send_message(message.chat.id, "Укажи категорию (например: одежда, техника, книги...)")
+# Реализация Fit трекера
+@dp.callback_query_handler(lambda c: c.data in ["record_steps", "record_calories", "record_weight"])
+async def record_fit_data(callback_query: types.CallbackQuery):
+    action = callback_query.data.split("_")[1]
+    await bot.send_message(callback_query.from_user.id, f"Введите количество {action}:")
+    dp.register_message_handler(lambda m: save_fit_data(m, action), state="*")
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id) == "want_category")
-def add_want_category(message):
-    entry = temp_wants.pop(message.chat.id)
-    entry["category"] = message.text
-    user_states.pop(message.chat.id)
+def save_fit_data(message: types.Message, action):
+    user_id = message.from_user.id
+    value = int(message.text)
+    today = datetime.now().strftime("%Y-%m-%d")
+    cursor.execute(f'INSERT INTO fit_tracker (user_id, date, {action}) VALUES (?, ?, ?)', (user_id, today, value))
+    conn.commit()
+    return bot.send_message(user_id, f"{action.capitalize()} записаны!")
 
-    data = load_data(WANTS_FILE)
-    user_id = str(message.chat.id)
-    if user_id not in data:
-        data[user_id] = []
-    data[user_id].append(entry)
-    save_data(data, WANTS_FILE)
-
-    bot.send_message(message.chat.id, "Хотелка сохранена! 💖")
-
-@bot.message_handler(func=lambda m: m.text == "📂 Список по категории")
-def show_wants(message):
-    data = load_data(WANTS_FILE).get(str(message.chat.id), [])
-    if not data:
-        bot.send_message(message.chat.id, "Ты пока не добавляла хотелок ✨")
-        return
-
-    cats = list(set([w['category'] for w in data]))
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    for c in cats:
-        markup.add(c)
-    markup.add("⬅️ Назад")
-    bot.send_message(message.chat.id, "Выбери категорию:", reply_markup=markup)
-    user_states[message.chat.id] = "want_category_view"
-
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id) == "want_category_view")
-def show_category_list(message):
-    category = message.text
-    data = load_data(WANTS_FILE).get(str(message.chat.id), [])
-    wants = [w for w in data if w['category'].lower() == category.lower()]
-
-    if wants:
-        text = f"🎁 Хотелки в категории '{category}':\n\n"
-        for w in wants:
-            text += f"• <a href='{w['link']}'>{w['title']}</a>\n"
-        bot.send_message(message.chat.id, text, parse_mode='HTML', disable_web_page_preview=True)
+# Реализация статистики
+@dp.callback_query_handler(lambda c: c.data in ["weekly_stats", "monthly_stats"])
+async def show_stats(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    period = callback_query.data.split("_")[0]
+    today = datetime.now()
+    if period == "weekly":
+        start_date = today - timedelta(days=today.weekday())
+        end_date = start_date + timedelta(days=6)
     else:
-        bot.send_message(message.chat.id, f"В категории '{category}' ничего нет ✨")
+        start_date = today.replace(day=1)
+        end_date = (start_date + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    
+    stats = cursor.execute('''
+    SELECT date, steps, calories, weight FROM fit_tracker 
+    WHERE user_id = ? AND date BETWEEN ? AND ?
+    ''', (user_id, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))).fetchall()
 
-    user_states.pop(message.chat.id, None)
+    # Формирование статистики
+    response = f"СТАТИСТИКА ЗА {period.upper()}:\n"
+    total_steps = sum([s[1] for s in stats if s[1]])
+    total_calories = sum([s[2] for s in stats if s[2]])
+    last_weight = [s[3] for s in stats if s[3]][-1] if any(s[3] for s in stats) else "не указан"
+    response += f"Вес: {last_weight}\n"
+    response += f"Средние шаги: {total_steps // len(stats)}\n"
+    response += f"Средние калории: {total_calories // len(stats)}\n"
 
-@bot.message_handler(func=lambda m: m.text == "⬅️ Назад")
-def back_to_main(message):
-    start_message(message)
+    await bot.send_message(user_id, response)
 
-@bot.message_handler(func=lambda message: True)
-def fallback(message):
-    bot.send_message(message.chat.id, "Я тебя не поняла 🙈 Нажми /start или выбери пункт из меню.")
-
-def morning_reminder():
-    data = load_data(PLANS_FILE)
-    today = get_today()
-    for user_id, plans in data.items():
-        todays = [p for p in plans if p['date'] == today]
-        if todays:
-            msg = "📌 Твои планы на сегодня:\n"
-            for p in todays:
-                t = f"[{p['time']}] " if p['time'] != "-" else ""
-                msg += f"— {t}{p['text']}\n"
-            try:
-                bot.send_message(user_id, msg)
-            except:
-                continue
-
-def schedule_jobs():
-    def run_schedule():
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
-    schedule.every().day.at("08:00").do(morning_reminder)
-    threading.Thread(target=run_schedule, daemon=True).start()
-
-schedule_jobs()
-bot.infinity_polling()
+# Запуск бота
+if __name__ == '__main__':
+    executor.start_polling(dp, skip_updates=True)
